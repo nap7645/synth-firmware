@@ -1,22 +1,30 @@
-# Dropping these files into the CubeIDE project
+# Euclid 1 — build, flash, bring-up
 
-## 1. Copy
+Integration is **done**. The app modules are in `Euclid1-V1/Core/Src` and `Core/Inc` alongside
+the CubeMX-generated files, and `main.c` is wired up. This document is what to do next.
 
-```bash
-cd ~/Desktop
-cp "Euclid Firmware Files/euclid1_src/Core/Inc/"*.h  synth-firmware/euclid/euclid1/Core/Inc/
-cp "Euclid Firmware Files/euclid1_src/Core/Src/"*.c  synth-firmware/euclid/euclid1/Core/Src/
-cp "Euclid Firmware Files/EUCLID1_CONTEXT.md" \
-   "Euclid Firmware Files/EUCLID1_CUBEMX_CONFIG.md" \
-   synth-firmware/docs/
+## Project layout
+
+```
+euclid1/
+├── EUCLID1_CUBEMX_CONFIG.md      peripheral config reference
+├── INTEGRATION.md                this file
+└── Euclid1-V1/                   the CubeIDE project
+    ├── Euclid1-V1.ioc
+    ├── Core/Src/  main.c stm32g4xx_it.c stm32g4xx_hal_msp.c syscalls.c ...
+    │               app.c display.c encoder.c euclid_gen.c param_store.c
+    │               seq_engine.c ui.c
+    └── Core/Inc/  main.h ...
+                    app.h display.h encoder.h euclid_config.h euclid_gen.h
+                    param_store.h seq_engine.h ui.h
 ```
 
-CubeIDE indexes `Core/Src` and `Core/Inc` automatically — no build-config changes needed.
-Right-click the project → Refresh (F5) if it doesn't notice.
+CubeIDE indexes `Core/Src` and `Core/Inc` automatically. If it doesn't see the new files,
+select the project and press **F5**.
 
-## 2. Two edits to `main.c`
+## What was wired into main.c
 
-Both inside `USER CODE` blocks, so regenerating from the `.ioc` won't touch them.
+Three edits, all inside `USER CODE` blocks so regenerating from the `.ioc` won't destroy them:
 
 ```c
 /* USER CODE BEGIN Includes */
@@ -25,9 +33,8 @@ Both inside `USER CODE` blocks, so regenerating from the `.ioc` won't touch them
 ```
 
 ```c
-  /* USER CODE BEGIN 2 */
+  /* USER CODE BEGIN WHILE */
   app_init();
-  /* USER CODE END 2 */
 
   while (1)
   {
@@ -39,63 +46,107 @@ Both inside `USER CODE` blocks, so regenerating from the `.ioc` won't touch them
   /* USER CODE END 3 */
 ```
 
-That is the entire integration. Everything else lives in the app modules.
+**`app_init()` is in USER CODE BEGIN WHILE, not USER CODE 2, and that placement matters.**
+`BSP_COM_Init()` sits between the two, and it is what configures LPUART1. Calling `app_init()`
+from USER CODE 2 would print the startup banner into an unconfigured UART and you'd see nothing.
 
-## 3. Do NOT let CubeMX start the timers
+## Debug console
 
-`app_init()` starts TIM1, TIM17 and all five encoder timers itself, in the right order and with
-the register tweaks that HAL doesn't expose. Don't add `HAL_TIM_*_Start()` calls of your own.
+The Nucleo BSP owns LPUART1 on PA2/PA3 as `hcom_uart[COM1]` — there is no `MX_LPUART1_Init()`
+and no `hlpuart1` handle. `app.c` borrows the BSP's handle for `__io_putchar()`.
 
-## 4. Bring-up order
+To enable: set `EUCLID_DEBUG_UART` to 1 in `euclid_config.h`, then open the ST-Link virtual COM
+port at 115200:
 
-Work through this in sequence — each step isolates one failure mode.
+```bash
+screen /dev/tty.usbmodem* 115200
+```
 
-1. **Build clean.** If `_Static_assert` errors, your project is on C99: set
-   Project → Properties → C/C++ Build → Settings → MCU GCC Compiler → Dialect to **gnu11**.
-2. **Confirm it runs.** Set `EUCLID_DEBUG_UART 1` in `euclid_config.h`, open the ST-Link VCP at
-   115200, and check you get the banner. Turn it back off before measuring timing — the blocking
-   UART transmit in `__io_putchar` is slow enough to matter.
-3. **Press Start/Stop.** With defaults (120 BPM, N=16, k = 4/5/7, gate 50 %) you should see
-   K1 on PC0 firing four evenly spaced gates per 16 steps, SUM on PC3 busiest, SOC on PC4 once
-   per 16 steps.
-4. **Scope one gate against clock out.** Rising edges must be coincident. If clock out leads or
-   lags by exactly one step period, the OC-preload disable in `seq_init()` didn't take.
-5. **Check the step period.** At 120 BPM with 4 steps per beat, one step is 125 ms and clock out
-   should read 8.00 Hz. If it's 4x off, `SEQ_STEPS_PER_BEAT` disagrees with what you expected.
-   If it's off by a smooth percentage, `SEQ_TIMER_HZ` doesn't match your actual prescaler.
-6. **Sweep gate length.** Hold Shift, turn Tempo. One full revolution should walk 5 % to 95 %
-   and hit both end stops. If it takes more or less than a revolution, your encoder isn't 18 PPR
-   and `SEQ_GATE_STEP_PCT` needs adjusting.
-7. **Check every encoder direction.** All five should increase clockwise. The N encoder is
-   already inverted in `ui_init()`; if any *other* one reads backwards, flip its `invert`
-   argument there rather than rewiring.
-8. **Save last.** See the warning below before the first save.
+`setvbuf(stdout, NULL, _IONBF, 0)` runs before the first `printf` — without it, short output sits
+in the stdio buffer and never appears, which looks exactly like code that didn't run.
 
-## 5. Before your first save — verify the flash page
+Turn it back off before scoping any timing. The blocking `HAL_UART_Transmit` is slow enough to
+distort measurements.
 
-`param_store.c` erases **bank 2, page 127, at 0x0807F800**, which assumes the option bit
-`DBANK = 1` (dual bank, 2 KB pages). That is the factory default for G474RE but it is not
-verified on your part.
+## Flashing
+
+**First flash, module out of the rack.** The Nucleo takes power from the Eurorack rails through
+the morpho headers and the ST-Link supplies power over USB — two sources on one rail, resolved by
+a jumper whose position should be established deliberately, not discovered.
+
+1. Remove the module from the rack. No Eurorack power.
+2. USB to the ST-Link port.
+3. **Run → Debug As → STM32 C/C++ Application.** Accept the ST-Link firmware update if offered.
+4. It halts at the top of `main()`. **F8** to resume.
+5. Disconnect USB, then install and power from the rack.
+
+Once you've confirmed the jumper arrangement, flashing in-rack is far more convenient.
+
+Use **Run As** rather than Debug As for flash-and-go once it works.
+
+If the debugger can't connect after a bad flash: debug configuration → Debugger tab → Reset
+behaviour → **Connect under reset**. That halts the core before your code runs. You have almost
+certainly not bricked anything.
+
+## Bring-up order
+
+Each step isolates one failure mode. Don't skip ahead.
+
+1. **Build clean.** If `_Static_assert` errors, Project → Properties → C/C++ Build → Settings →
+   MCU GCC Compiler → General → Language standard → **gnu11**.
+2. **Banner appears** over the VCP. That one line confirms the clock configured, `app_init()` was
+   reached, and flash recall ran.
+3. **Press Start/Stop.** Defaults are 120 BPM, N=16, k = 4/5/7, gate 50 %. Expect four evenly
+   spaced gates per 16 steps on PC0, SUM busiest on PC3, SOC once per cycle on PC4.
+4. **Scope a gate against clock out.** Rising edges must be **coincident**. One step period of
+   offset means the OC-preload disable in `seq_init()` didn't take.
+5. **Step rate.** 120 BPM at 4 steps/beat = 8.00 Hz on clock out, 125 ms per step. A 4× error
+   means `SEQ_STEPS_PER_BEAT` isn't what you expected; a smooth percentage error means
+   `SEQ_TIMER_HZ` disagrees with the actual prescaler.
+6. **Gate sweep.** Hold Shift, turn Tempo. One full revolution should walk 5 %→95 % and hit both
+   stops. More or less than a revolution means the encoder isn't 18 PPR and `SEQ_GATE_STEP_PCT`
+   needs adjusting.
+7. **Encoder directions.** All five should increase clockwise. N is already inverted in
+   `ui_init()`; if any *other* one reads backwards, flip its `invert` argument there.
+8. **Double-counting.** If any encoder skips or doubles, raise `IC1Filter`/`IC2Filter` from 8 to
+   15 in CubeMX.
+9. **Save last** — read the flash warning below first.
+
+## Before your first save: verify the flash page
+
+`param_store.c` erases **bank 2, page 127, at 0x0807F800**, which assumes option bit `DBANK = 1`
+(dual bank, 2 KB pages). That's the factory default for G474RE but is **not verified on your
+part**.
 
 Check in STM32CubeProgrammer → Option Bytes → User Configuration → **DBANK**.
 
-- `DBANK = 1` → the constants in `param_store.c` are correct, no change needed.
-- `DBANK = 0` → single bank, 4 KB pages. Change to `FLASH_BANK_1`, page `127`,
-  address `0x0807F000`.
+- `DBANK = 1` → constants are correct, no change.
+- `DBANK = 0` → single bank, 4 KB pages. Change to `FLASH_BANK_1`, page 127, `0x0807F000`.
 
-Getting this wrong won't brick the part — it will erase a page of program flash you're not using
-at 41 KB of code — but it will make saves silently fail. `param_store_save()` reads back and
-verifies, so `ui_last_save_result()` will tell you.
+Getting it wrong won't brick the part — it erases a page of program flash you aren't using — but
+saves will silently fail. `param_store_save()` reads back and verifies, so
+`ui_last_save_result()` will tell you.
 
-## 6. Host-side test of the pattern generator
+Save gesture: hold **Shift first**, then Start/Stop, for 2 seconds. It stops the sequencer before
+erasing, because a page erase stalls the bus for tens of milliseconds and would be audible.
 
-The generator has no hardware dependency, so you can test it without the board:
+## Host-side test of the pattern generator
+
+`euclid_gen.c` has no hardware dependency, so it tests on your laptop:
 
 ```bash
-cd synth-firmware/euclid/euclid1/Core/Src
+cd Euclid1-V1/Core/Src
 cc -std=c99 -I../Inc -DEUCLID_GEN_TEST euclid_gen.c -o /tmp/egt && /tmp/egt
 ```
 
-It asserts, for every n in 1..64 and every k in 0..n, that the hit count equals k, that the
-downbeat is always present when k > 0, and that rotation is cyclic with period n. Then it prints
-some known patterns to eyeball. Worth re-running any time you touch that file.
+Asserts, for every n in 1..64 and every k in 0..n, that the hit count equals k, the downbeat is
+present whenever k > 0, and rotation is cyclic with period n. Then prints known patterns to
+eyeball. Re-run any time you touch that file.
+
+## Display
+
+`display.c` is a **stub**. `EUCLID_DISPLAY` is 0, so it compiles to no-ops and needs no
+dependencies. To bring it up: add an SSD1306 driver, point it at SPI2 and PB10/PB11/PB12, set
+`EUCLID_DISPLAY` to 1, fill in the `oled_*` porting functions and then `draw_overview()`.
+
+Redraw only on change, from the main loop, never from an ISR.
