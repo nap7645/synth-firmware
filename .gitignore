@@ -1,0 +1,19 @@
+# STM32CubeIDE build output
+Debug/
+Release/
+*.o
+*.d
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+*.su
+
+# IDE local state
+.settings/
+.metadata/
+RemoteSystemsTempFiles/
+
+# macOS
+.DS_Store
